@@ -801,8 +801,17 @@ open class WebViewActivity : AppCompatActivity() {
                 when {
                     customView != null -> hideCustomView()
                     else -> {
+                        val surface = browserSurface
+                        if (surface?.isGecko == true) {
+                            if (surface.canGoBack()) {
+                                surface.goBack()
+                            } else {
+                                finish()
+                            }
+                            return
+                        }
 
-                        val wv = webView
+                        val wv = surface?.webView ?: webView
                         if (wv != null) {
                             wv.evaluateJavascript("""
                                 (function() {
