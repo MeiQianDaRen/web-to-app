@@ -6,6 +6,7 @@ import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
 import com.webtoapp.WebToAppApplication
+import com.webtoapp.core.engine.BrowserSurface
 import com.webtoapp.core.forcedrun.ForcedRunManager
 import com.webtoapp.core.i18n.Strings
 import com.webtoapp.core.logging.AppLogger
@@ -202,6 +203,7 @@ object ShellActivityInit {
         activity: AppCompatActivity,
         forcedRunManager: ForcedRunManager,
         getCustomView: () -> android.view.View?,
+        getBrowserSurface: () -> BrowserSurface?,
         getWebView: () -> WebView?,
         hideCustomView: () -> Unit,
         getShellConfig: () -> ShellConfig?
@@ -215,8 +217,17 @@ object ShellActivityInit {
                 when {
                     getCustomView() != null -> hideCustomView()
                     else -> {
+                        val surface = getBrowserSurface()
+                        if (surface?.isGecko == true) {
+                            if (surface.canGoBack()) {
+                                surface.goBack()
+                            } else {
+                                activity.finish()
+                            }
+                            return
+                        }
 
-                        val wv = getWebView()
+                        val wv = surface?.webView ?: getWebView()
                         if (wv != null) {
                             wv.evaluateJavascript("""
                                 (function() {
