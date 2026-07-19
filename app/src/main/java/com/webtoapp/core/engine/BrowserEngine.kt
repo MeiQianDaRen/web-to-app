@@ -1,48 +1,822 @@
 package com.webtoapp.core.engine
 
 import android.content.Context
+import android.util.Base64
+import com.webtoapp.core.logging.AppLogger
+import com.webtoapp.core.i18n.Strings
 import android.view.View
+import com.webtoapp.data.model.UserAgentMode
 import com.webtoapp.data.model.WebViewConfig
+import org.json.JSONObject
+import org.mozilla.geckoview.AllowOrDeny
+import org.mozilla.geckoview.ContentBlocking
+import org.mozilla.geckoview.GeckoResult
+import org.mozilla.geckoview.GeckoRuntime
+import org.mozilla.geckoview.GeckoRuntimeSettings
+import org.mozilla.geckoview.GeckoSession
+import org.mozilla.geckoview.GeckoSessionSettings
+import org.mozilla.geckoview.GeckoView
+import org.mozilla.geckoview.StorageController
+import org.mozilla.geckoview.WebRequestError
+import org.mozilla.geckoview.WebResponse
+import org.mozilla.geckoview.WebExtension
 
-interface BrowserEngine {
+class GeckoViewEngine(
+    private val context: Context
+) : BrowserEngine {
 
-    val engineType: EngineType
+    companion object {
+        private const val TAG = "GeckoViewEngine"
 
-    fun createView(
+        @Volatile
+        private var sharedRuntime: GeckoRuntime? = null
+
+        @Volatile
+        private var runtimeConfigFingerprint: String = ""
+
+        @Volatile
+        private var nativeBridgeExtension: WebExtension? = null
+
+        @Volatile
+        private var activeNativeBridge: com.webtoapp.core.webview.NativeBridge? = null
+
+        private const val NATIVE_BRIDGE_APP = "wta_native_bridge"
+
+        fun ensureNativeBridgeExtension(runtime: GeckoRuntime): WebExtension? {
+            nativeBridgeExtension?.let { return it }
+            synchronized(this) {
+                nativeBridgeExtension?.let { return it }
+                val url = "resource://android/assets/web_extensions/wta_native_bridge/"
+                val controller = runtime.webExtensionController
+                val installResult = controller.installBuiltIn(url)
+                installResult.accept { ext ->
+                    ext?.setMessageDelegate(object : WebExtension.MessageDelegate {
+                        override fun onMessage(
+                            nativeApp: String,
+                            message: Any,
+                            sender: WebExtension.MessageSender
+                        ): GeckoResult<Any>? {
+                            val bridge = activeNativeBridge
+                            if (bridge == null) {
+                                return GeckoResult.fromValue(errorJson("REQUEST_FAILED", "Native bridge not ready"))
+                            }
+                            val requestJson = when (message) {
+                                is String -> message
+                                else -> message.toString()
+                            }
+                            return try {
+                                val response = bridge.httpRequest(requestJson)
+                                GeckoResult.fromValue(response)
+                            } catch (e: Exception) {
+                                GeckoResult.fromValue(errorJson("REQUEST_FAILED", e.message ?: e::class.java.simpleName))
+                            }
+                        }
+                    }, NATIVE_BRIDGE_APP)
+                    nativeBridgeExtension = ext
+                    AppLogger.d(TAG, "Native bridge WebExtension installed")
+                }
+                return null
+            }
+        }
+
+        private fun errorJson(code: String, message: String): String {
+            return org.json.JSONObject().apply {
+                put("ok", false)
+                put("error", code)
+                put("message", message)
+            }.toString()
+        }
+
+        private fun currentConfigFingerprint(): String {
+            val ech = currentDnsConfig?.echEffective == true
+            val proxy = currentProxyConfig?.let { buildProxyPrefs(it) } ?: emptyMap()
+            val proxyKey = proxy.entries.joinToString(",") { "${it.key}=${it.value}" }
+            return "ech=$ech|proxy=$proxyKey|tlsMitm=$tlsMitmActive"
+        }
+
+        fun getRuntime(context: Context): GeckoRuntime {
+            return sharedRuntime ?: synchronized(this) {
+                sharedRuntime ?: createRuntime(context.applicationContext).also {
+                    sharedRuntime = it
+                    runtimeConfigFingerprint = currentConfigFingerprint()
+                }
+            }
+        }
+
+        fun ensureRuntimeForConfig(context: Context) {
+            val want = currentConfigFingerprint()
+            synchronized(this) {
+                val existing = sharedRuntime
+                if (existing == null) {
+                    AppLogger.d(TAG, "ensureRuntimeForConfig: no existing runtime, creating new (want=$want)")
+                    getRuntime(context)
+                    return
+                }
+                if (want != runtimeConfigFingerprint) {
+                    AppLogger.i(
+                        TAG,
+                        "Recreating GeckoRuntime to apply config change (want=$want, current=$runtimeConfigFingerprint)"
+                    )
+                    try {
+                        existing.shutdown()
+                        clearGeckoProfileDir(context)
+                    } catch (e: Exception) {
+                        AppLogger.w(TAG, "GeckoRuntime shutdown failed during config recreate: ${e.message}")
+                    }
+                    sharedRuntime = null
+                    getRuntime(context)
+                } else {
+                    AppLogger.d(TAG, "ensureRuntimeForConfig: config unchanged (want=$want), reusing existing runtime")
+                }
+            }
+        }
+
+        @Volatile
+        private var currentDnsConfig: com.webtoapp.data.model.DnsConfig? = null
+
+        @Volatile
+        private var currentProxyConfig: ProxyConfig? = null
+
+        @Volatile
+        private var tlsMitmActive: Boolean = false
+
+        @Volatile
+        private var antiCaptureActive: Boolean = false
+
+        fun setTlsMitmActive(active: Boolean) {
+            tlsMitmActive = active
+        }
+
+        fun applyAntiCapture(active: Boolean) {
+            antiCaptureActive = active
+            AppLogger.d(TAG, "applyAntiCapture: active=$active")
+        }
+
+        fun applyDnsConfig(config: com.webtoapp.data.model.DnsConfig) {
+            currentDnsConfig = config
+            AppLogger.d(TAG, "applyDnsConfig: provider=${config.provider}, echEnabled=${config.echEnabled}, echEffective=${config.echEffective}, dohMode=${config.dohMode}, dohUrl=${config.effectiveDohUrl}")
+            val runtime = sharedRuntime ?: return
+            applyDohToRuntime(runtime, config)
+        }
+
+        fun applyProxyConfig(config: ProxyConfig) {
+            currentProxyConfig = config
+
+            val runtime = sharedRuntime
+            if (runtime != null && config.mode != "NONE") {
+                AppLogger.w(TAG, "GeckoView proxy set after runtime creation — proxy will take effect on next runtime creation")
+            }
+            AppLogger.d(TAG, "Proxy config stored: mode=${config.mode}, type=${config.type}, host=${config.host}:${config.port}")
+        }
+
+        private fun buildProxyPrefs(config: ProxyConfig): Map<String, Any> {
+            if (config.mode == "NONE") return emptyMap()
+            val prefs = LinkedHashMap<String, Any>()
+            when (config.mode) {
+                "STATIC" -> {
+                    if (config.host.isBlank() || config.port <= 0) return emptyMap()
+
+                    prefs["network.proxy.type"] = 1
+
+                    when (config.type.uppercase()) {
+                        "SOCKS5", "SOCKS" -> {
+                            prefs["network.proxy.socks"] = config.host
+                            prefs["network.proxy.socks_port"] = config.port
+                            prefs["network.proxy.socks_version"] = 5
+
+                            prefs["network.proxy.socks_remote_dns"] = true
+                        }
+                        "HTTPS" -> {
+
+                            prefs["network.proxy.ssl"] = config.host
+                            prefs["network.proxy.ssl_port"] = config.port
+                            prefs["network.proxy.http"] = config.host
+                            prefs["network.proxy.http_port"] = config.port
+                            prefs["network.proxy.share_proxy_settings"] = true
+                        }
+                        else -> {
+
+                            prefs["network.proxy.http"] = config.host
+                            prefs["network.proxy.http_port"] = config.port
+                            prefs["network.proxy.ssl"] = config.host
+                            prefs["network.proxy.ssl_port"] = config.port
+                            prefs["network.proxy.share_proxy_settings"] = true
+                        }
+                    }
+                }
+                "PAC" -> {
+                    if (config.pacUrl.isBlank()) return emptyMap()
+
+                    prefs["network.proxy.type"] = 2
+                    prefs["network.proxy.autoconfig_url"] = config.pacUrl
+                }
+            }
+            return prefs
+        }
+
+        private fun applyDohToRuntime(runtime: GeckoRuntime, config: com.webtoapp.data.model.DnsConfig) {
+            val dohUrl = config.effectiveDohUrl
+            if (dohUrl.isBlank()) {
+
+                runtime.settings.setTrustedRecursiveResolverMode(GeckoRuntimeSettings.TRR_MODE_OFF)
+                AppLogger.d(TAG, "DoH disabled, using system DNS")
+                return
+            }
+
+            val trrMode = if (config.dohMode == "strict" || config.bypassSystemDns) {
+                GeckoRuntimeSettings.TRR_MODE_ONLY
+            } else {
+                GeckoRuntimeSettings.TRR_MODE_FIRST
+            }
+
+            runtime.settings.setTrustedRecursiveResolverMode(trrMode)
+            runtime.settings.setTrustedRecursiveResolverUri(dohUrl)
+
+            AppLogger.d(TAG, "DoH applied to GeckoView: provider=${config.provider}, mode=$trrMode, url=$dohUrl")
+
+            if (config.echEffective) {
+                AppLogger.d(
+                    TAG,
+                    "ECH requested but only takes effect from runtime creation (via configFilePath prefs); " +
+                        "it will apply on next GeckoRuntime creation"
+                )
+            }
+        }
+
+        private const val GECKO_CONFIG_FILE = "geckoview-config.yaml"
+
+        private fun writeGeckoConfigFile(context: Context, config: com.webtoapp.data.model.DnsConfig?): String {
+            val configFile = java.io.File(context.filesDir, GECKO_CONFIG_FILE)
+            val prefs = LinkedHashMap<String, Any>()
+            prefs["network.stricttransportsecurity.preloadlist"] = false
+            prefs["security.cert_pinning.enforcement_level"] = 0
+            prefs["security.OCSP.enabled"] = 0
+            prefs["security.OCSP.require"] = false
+            prefs["security.ssl.enable_ocsp_must_staple"] = false
+            prefs["security.ssl.enable_ocsp_stapling"] = false
+            if (config?.echEffective == true) {
+                prefs["network.dns.echconfig.enabled"] = true
+                prefs["network.dns.http3_echconfig.enabled"] = true
+                prefs["network.dns.upgrade_with_https_rr"] = true
+                prefs["network.dns.use_https_rr_as_altsvc"] = true
+                prefs["network.dns.echconfig.fallback_to_origin_when_all_failed"] = true
+                prefs["network.dns.force_use_https_rr"] = true
+            }
+
+            val appProxy = currentProxyConfig
+            val hasAppProxy = appProxy != null && appProxy.mode != "NONE"
+            if (antiCaptureActive && !hasAppProxy) {
+                prefs["network.proxy.type"] = 0
+            } else {
+                appProxy?.let { prefs.putAll(buildProxyPrefs(it)) }
+            }
+
+            if (antiCaptureActive) {
+                prefs["security.enterprise_roots.enabled"] = false
+            } else if (tlsMitmActive) {
+                prefs["security.enterprise_roots.enabled"] = true
+            }
+
+            val yaml = buildString {
+                append("prefs:\n")
+                if (prefs.isEmpty()) {
+                    append("  {}\n")
+                } else {
+                    prefs.forEach { (key, value) ->
+                        append("  ").append(key).append(": ").append(yamlValue(value)).append("\n")
+                    }
+                }
+            }
+
+            return try {
+                configFile.writeText(yaml)
+                AppLogger.d(TAG, "Gecko config written (prefs=${prefs.size}): ${configFile.absolutePath}")
+                AppLogger.d(TAG, "Gecko config content:\n$yaml")
+                configFile.absolutePath
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "Failed to write Gecko config file", e)
+                ""
+            }
+        }
+
+        private fun yamlValue(value: Any): String = when (value) {
+            is Boolean, is Int, is Long -> value.toString()
+            else -> "\"" + value.toString().replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+        }
+
+        private fun createRuntime(context: Context): GeckoRuntime {
+            val settingsBuilder = GeckoRuntimeSettings.Builder()
+                .javaScriptEnabled(true)
+                .consoleOutput(true)
+                .allowInsecureConnections(GeckoRuntimeSettings.ALLOW_ALL)
+                .contentBlocking(
+
+                    ContentBlocking.Settings.Builder()
+                        .antiTracking(ContentBlocking.AntiTracking.NONE)
+                        .safeBrowsing(ContentBlocking.SafeBrowsing.NONE)
+                        .cookieBehavior(ContentBlocking.CookieBehavior.ACCEPT_ALL)
+                        .build()
+                )
+
+            currentDnsConfig?.let { config ->
+                val dohUrl = config.effectiveDohUrl
+                if (dohUrl.isNotBlank()) {
+                    val trrMode = if (config.dohMode == "strict" || config.bypassSystemDns || config.echEffective) {
+                        GeckoRuntimeSettings.TRR_MODE_ONLY
+                    } else {
+                        GeckoRuntimeSettings.TRR_MODE_FIRST
+                    }
+                    settingsBuilder.trustedRecursiveResolverMode(trrMode)
+                    settingsBuilder.trustedRecursiveResolverUri(dohUrl)
+                }
+            }
+
+            val configFilePath = writeGeckoConfigFile(context, currentDnsConfig)
+            if (configFilePath.isNotBlank()) {
+                settingsBuilder.configFilePath(configFilePath)
+                AppLogger.d(TAG, "GeckoView configFilePath set: $configFilePath (ech=${currentDnsConfig?.echEffective == true}, proxy=${currentProxyConfig?.mode ?: "NONE"})")
+            }
+
+            return GeckoRuntime.create(context, settingsBuilder.build())
+        }
+
+        private fun clearGeckoProfileDir(context: Context) {
+            try {
+                val profileDir = java.io.File(context.filesDir, "geckoview")
+                if (profileDir.exists()) {
+                    profileDir.deleteRecursively()
+                    AppLogger.d(TAG, "GeckoView profile cleared for fresh ECH/pref init")
+                }
+            } catch (e: Exception) {
+                AppLogger.w(TAG, "Failed to clear GeckoView profile: ${e.message}")
+            }
+        }
+    }
+
+    override val engineType = EngineType.GECKOVIEW
+
+    private var geckoView: GeckoView? = null
+    private var session: GeckoSession? = null
+    private var callback: BrowserEngineCallback? = null
+    private var currentUrl: String? = null
+    private var currentTitle: String? = null
+    private var canGoBackFlag = false
+    private var canGoForwardFlag = false
+
+    private var lastConfig: WebViewConfig? = null
+    private var lastGeckoUaMode: Int = GeckoSessionSettings.USER_AGENT_MODE_MOBILE
+    private var lastUserAgentOverride: String? = null
+
+    private var bridgeScope: kotlinx.coroutines.CoroutineScope? = null
+
+    override fun createView(
         context: Context,
         config: WebViewConfig,
         callback: BrowserEngineCallback
-    ): View
+    ): View {
+        this.callback = callback
+        this.lastConfig = config
 
-    fun loadUrl(url: String)
+        val echInfo = if (config.dnsMode != "SYSTEM") {
+            applyDnsConfig(config.dnsConfig)
+            val ech = config.dnsConfig.echEffective
+            if (ech) "ECH_ENABLED" else "ECH_DISABLED"
+        } else {
+            "SYSTEM_DNS"
+        }
+        AppLogger.i(TAG, "createView: engine=GeckoView, engineType=${engineType}, dnsMode=${config.dnsMode}, ech=$echInfo")
+        ensureRuntimeForConfig(context)
 
-    fun evaluateJavascript(script: String, resultCallback: ((String?) -> Unit)? = null)
+        val runtime = getRuntime(context)
 
-    fun canGoBack(): Boolean
+        if (config.enableCorsBypass || config.enablePrivateNetworkBridge) {
+            if (bridgeScope == null) bridgeScope = kotlinx.coroutines.MainScope()
+            val bridge = com.webtoapp.core.webview.NativeBridge(
+                context = context.applicationContext,
+                scope = bridgeScope!!,
+                webViewProvider = { null },
+                capabilities = config.nativeBridgeCapabilities,
+                corsBypass = config.enableCorsBypass,
+                downloadLocationMode = config.downloadLocationMode,
+                customDownloadDirUri = config.customDownloadDirUri
+            )
+            activeNativeBridge = bridge
+            ensureNativeBridgeExtension(runtime)
+        }
 
-    fun goBack()
+        val geckoUaMode = when (config.userAgentMode) {
+            UserAgentMode.CHROME_DESKTOP, UserAgentMode.SAFARI_DESKTOP,
+            UserAgentMode.FIREFOX_DESKTOP, UserAgentMode.EDGE_DESKTOP -> GeckoSessionSettings.USER_AGENT_MODE_DESKTOP
+            else -> GeckoSessionSettings.USER_AGENT_MODE_MOBILE
+        }
+        this.lastGeckoUaMode = geckoUaMode
 
-    fun canGoForward(): Boolean
+        val sessionSettings = GeckoSessionSettings.Builder()
+            .usePrivateMode(false)
+            .useTrackingProtection(false)
+            .userAgentMode(geckoUaMode)
+            .build()
 
-    fun goForward()
+        val newSession = GeckoSession(sessionSettings)
+        setupDelegates(newSession, callback)
 
-    fun reload()
+        newSession.open(runtime)
+        session = newSession
 
-    fun stopLoading()
+        val view = GeckoView(context)
+        view.setSession(newSession)
+        geckoView = view
 
-    fun getCurrentUrl(): String?
+        val effectiveUserAgent = when (config.userAgentMode) {
+            UserAgentMode.DEFAULT -> null
+            UserAgentMode.CUSTOM -> config.customUserAgent?.takeIf { it.isNotBlank() }
+            else -> config.userAgentMode.userAgentString
+        }
+        if (effectiveUserAgent != null) {
+            newSession.settings.userAgentOverride = effectiveUserAgent
+            lastUserAgentOverride = effectiveUserAgent
+            AppLogger.d(TAG, "User-Agent set: ${effectiveUserAgent.take(80)}...")
+        }
 
-    fun getTitle(): String?
-
-    fun getView(): View?
-
-    fun requestFocus() {
-        getView()?.requestFocus()
+        return view
     }
 
-    fun destroy()
+    private fun setupDelegates(session: GeckoSession, callback: BrowserEngineCallback) {
+        setupContentDelegate(session, callback)
+        setupNavigationDelegate(session, callback)
+        setupProgressDelegate(session, callback)
+        setupPermissionDelegate(session)
+    }
 
-    fun clearCache(includeDiskFiles: Boolean = true)
+    private fun setupContentDelegate(session: GeckoSession, callback: BrowserEngineCallback) {
+        session.contentDelegate = object : GeckoSession.ContentDelegate {
+            override fun onTitleChange(session: GeckoSession, title: String?) {
+                currentTitle = title
+                callback.onTitleChanged(title)
+            }
 
-    fun clearHistory()
+            override fun onFullScreen(session: GeckoSession, fullScreen: Boolean) {
+                if (fullScreen) {
+                    callback.onShowCustomView(geckoView, null)
+                } else {
+                    callback.onHideCustomView()
+                }
+            }
+
+            override fun onExternalResponse(session: GeckoSession, response: WebResponse) {
+                val contentType = response.headers["Content-Type"] ?: "application/octet-stream"
+                val contentDisposition = response.headers["Content-Disposition"] ?: ""
+                val contentLength = response.headers["Content-Length"]?.toLongOrNull() ?: -1L
+                val ua = lastUserAgentOverride ?: lastConfig?.let { cfg ->
+                    when (cfg.userAgentMode) {
+                        UserAgentMode.DEFAULT -> ""
+                        UserAgentMode.CUSTOM -> cfg.customUserAgent ?: ""
+                        else -> cfg.userAgentMode.userAgentString
+                    }
+                } ?: ""
+                callback.onDownloadStart(
+                    response.uri,
+                    ua,
+                    contentDisposition,
+                    contentType,
+                    contentLength
+                )
+            }
+
+            override fun onCrash(session: GeckoSession) {
+                AppLogger.e(TAG, "GeckoView session crashed, attempting recovery...")
+                callback.onError(-1, "Engine crash — recovering...")
+                attemptCrashRecovery()
+            }
+        }
+    }
+
+    private fun setupNavigationDelegate(session: GeckoSession, callback: BrowserEngineCallback) {
+        session.navigationDelegate = object : GeckoSession.NavigationDelegate {
+            override fun onLocationChange(
+                session: GeckoSession,
+                url: String?,
+                perms: MutableList<GeckoSession.PermissionDelegate.ContentPermission>,
+                hasUserGesture: Boolean
+            ) {
+                currentUrl = url
+            }
+
+            override fun onCanGoBack(session: GeckoSession, canGoBack: Boolean) {
+                canGoBackFlag = canGoBack
+            }
+
+            override fun onCanGoForward(session: GeckoSession, canGoForward: Boolean) {
+                canGoForwardFlag = canGoForward
+            }
+
+            override fun onLoadRequest(
+                session: GeckoSession,
+                request: GeckoSession.NavigationDelegate.LoadRequest
+            ): GeckoResult<AllowOrDeny>? {
+                val uri = request.uri
+
+                if (uri.startsWith("tel:") || uri.startsWith("mailto:") || uri.startsWith("intent:")) {
+                    callback.onExternalLink(uri)
+                    return GeckoResult.fromValue(AllowOrDeny.DENY)
+                }
+
+                val cfg = lastConfig
+                if (cfg != null && cfg.openExternalLinks) {
+                    val scheme = runCatching { android.net.Uri.parse(uri).scheme?.lowercase() }.getOrNull()
+                    if (scheme == "http" || scheme == "https") {
+                        val targetHost = runCatching { android.net.Uri.parse(uri).host?.lowercase() }.getOrNull()
+                        val currentHost = runCatching { currentUrl?.let { android.net.Uri.parse(it).host?.lowercase() } }.getOrNull()
+                        if (targetHost != null && currentHost != null &&
+                            targetHost != currentHost &&
+                            !targetHost.endsWith(".$currentHost") &&
+                            !currentHost.endsWith(".$targetHost")) {
+                            callback.onExternalLink(uri)
+                            return GeckoResult.fromValue(AllowOrDeny.DENY)
+                        }
+                    }
+                }
+
+                return GeckoResult.fromValue(AllowOrDeny.ALLOW)
+            }
+
+            override fun onLoadError(
+                session: GeckoSession,
+                uri: String?,
+                error: WebRequestError
+            ): GeckoResult<String>? {
+                val isCertificateError =
+                    error.category == WebRequestError.ERROR_CATEGORY_SECURITY ||
+                        error.code == WebRequestError.ERROR_BAD_HSTS_CERT
+                if (!isCertificateError) return null
+
+                val detail = "code=${error.code}, uri=${uri.orEmpty()}"
+                AppLogger.w(TAG, "GeckoView SSL error: $detail")
+
+                if (!uri.isNullOrBlank()) {
+                    return GeckoResult.fromValue(buildCertificateErrorPage(uri))
+                }
+
+                if (lastConfig?.errorPageConfig?.showSslErrorUi == false) return null
+
+                callback.onSslError(detail)
+                return null
+            }
+
+            override fun onNewSession(
+                session: GeckoSession,
+                uri: String
+            ): GeckoResult<GeckoSession>? {
+                loadUrl(uri)
+                return null
+            }
+        }
+    }
+
+    private fun buildCertificateErrorPage(failedUrl: String): String {
+        val title = escapeHtml(Strings.showSslErrorUiTitle)
+        val retry = escapeHtml(Strings.retry)
+        val close = escapeHtml(Strings.cdClose)
+        val displayUrl = escapeHtml(failedUrl)
+        val targetUrl = JSONObject.quote(failedUrl)
+        val html = """
+            <!doctype html>
+            <html>
+            <head>
+                <meta charset="utf-8">
+                <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+                <style>
+                    *{box-sizing:border-box}html,body{height:100%;margin:0}body{display:flex;align-items:center;justify-content:center;padding:24px;background:#f5f7fb;color:#1f2937;font-family:system-ui,-apple-system,sans-serif}.card{width:100%;max-width:560px;padding:28px;border:1px solid #dbe4f0;border-radius:18px;background:#fff;box-shadow:0 18px 50px rgba(35,55,80,.14)}.auto-proceed .card{visibility:hidden}.icon{display:flex;align-items:center;justify-content:center;width:52px;height:52px;margin-bottom:18px;border-radius:50%;background:#fff3db;color:#d97706;font-size:28px}.title{margin:0 0 12px;font-size:22px}.url{margin:0 0 22px;padding:12px;border-radius:10px;background:#f7f9fc;color:#526173;font-size:13px;line-height:1.5;word-break:break-all}.actions{display:flex;flex-wrap:wrap;gap:10px}button{min-height:42px;padding:0 18px;border:0;border-radius:9px;font-size:15px;cursor:pointer}.primary{background:#1677ff;color:#fff}.secondary{background:#edf2f7;color:#334155}button:disabled{opacity:.55}@media(prefers-color-scheme:dark){body{background:#111827;color:#e5e7eb}.card{border-color:#334155;background:#1f2937}.url{background:#111827;color:#cbd5e1}.secondary{background:#374151;color:#f3f4f6}}
+                </style>
+            </head>
+            <body class="auto-proceed">
+                <main class="card">
+                    <div class="icon">!</div>
+                    <h1 class="title">$title</h1>
+                    <div class="url">$displayUrl</div>
+                    <div class="actions">
+                        <button class="primary" id="proceed" type="button">$retry</button>
+                        <button class="secondary" id="back" type="button">$close</button>
+                    </div>
+                </main>
+                <script>
+                    function proceed(){
+                        var button=document.getElementById('proceed');
+                        button.disabled=true;
+                        document.addCertException(false).catch(function(){
+                            return document.addCertException(true);
+                        }).then(function(){
+                            location.replace($targetUrl);
+                        }).catch(function(){
+                            button.disabled=false;
+                            document.body.classList.remove('auto-proceed');
+                        });
+                    }
+                    document.getElementById('proceed').addEventListener('click',proceed);
+                    document.getElementById('back').addEventListener('click',function(){history.back();});
+                    proceed();
+                </script>
+            </body>
+            </html>
+        """.trimIndent()
+        val encoded = Base64.encodeToString(html.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+        return "data:text/html;base64,$encoded"
+    }
+
+    private fun escapeHtml(value: String): String = value
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("\"", "&quot;")
+        .replace("'", "&#39;")
+
+    private fun setupProgressDelegate(session: GeckoSession, callback: BrowserEngineCallback) {
+        session.progressDelegate = object : GeckoSession.ProgressDelegate {
+            override fun onPageStart(session: GeckoSession, url: String) {
+
+                callback.onPageStarted(url)
+
+            }
+
+            override fun onPageStop(session: GeckoSession, success: Boolean) {
+                callback.onPageFinished(currentUrl)
+            }
+
+            override fun onProgressChange(session: GeckoSession, progress: Int) {
+                callback.onProgressChanged(progress)
+            }
+
+            override fun onSecurityChange(
+                session: GeckoSession,
+                securityInfo: GeckoSession.ProgressDelegate.SecurityInformation
+            ) {
+
+            }
+        }
+    }
+
+    private fun setupPermissionDelegate(session: GeckoSession) {
+        session.permissionDelegate = object : GeckoSession.PermissionDelegate {
+            override fun onContentPermissionRequest(
+                session: GeckoSession,
+                perm: GeckoSession.PermissionDelegate.ContentPermission
+            ): GeckoResult<Int>? {
+                val cfg = lastConfig
+                if (perm.permission == GeckoSession.PermissionDelegate.PERMISSION_GEOLOCATION) {
+                    if (cfg == null || !cfg.geolocationEnabled) {
+                        return GeckoResult.fromValue(GeckoSession.PermissionDelegate.ContentPermission.VALUE_DENY)
+                    }
+                    val policy = cfg.geolocationPolicy.name
+                    when (policy) {
+                        "DENY_ALL" -> {
+                            return GeckoResult.fromValue(GeckoSession.PermissionDelegate.ContentPermission.VALUE_DENY)
+                        }
+                        "REMEMBER_PER_HOST" -> {
+                            val allowed = com.webtoapp.ui.shell.GeolocationPermissionsSingleton.getAllowedOrigins()
+                            if (perm.uri != null && allowed.contains(perm.uri)) {
+                                return GeckoResult.fromValue(GeckoSession.PermissionDelegate.ContentPermission.VALUE_ALLOW)
+                            }
+                        }
+                    }
+                    return GeckoResult.fromValue(GeckoSession.PermissionDelegate.ContentPermission.VALUE_ALLOW)
+                }
+                return GeckoResult.fromValue(GeckoSession.PermissionDelegate.ContentPermission.VALUE_ALLOW)
+            }
+
+            override fun onMediaPermissionRequest(
+                session: GeckoSession,
+                uri: String,
+                video: Array<GeckoSession.PermissionDelegate.MediaSource>?,
+                audio: Array<GeckoSession.PermissionDelegate.MediaSource>?,
+                callback: GeckoSession.PermissionDelegate.MediaCallback
+            ) {
+                callback.grant(video?.firstOrNull(), audio?.firstOrNull())
+            }
+
+            override fun onAndroidPermissionsRequest(
+                session: GeckoSession,
+                permissions: Array<out String>?,
+                callback: GeckoSession.PermissionDelegate.Callback
+            ) {
+                callback.grant()
+            }
+        }
+    }
+
+    private fun attemptCrashRecovery() {
+        val view = geckoView ?: return
+        val cb = callback ?: return
+        val urlToRestore = currentUrl
+
+        try {
+
+            try { session?.close() } catch (_: Exception) { }
+            session = null
+
+            val runtime = getRuntime(context)
+
+            val sessionSettings = GeckoSessionSettings.Builder()
+                .usePrivateMode(false)
+                .useTrackingProtection(false)
+                .userAgentMode(lastGeckoUaMode)
+                .build()
+
+            val newSession = GeckoSession(sessionSettings)
+            setupDelegates(newSession, cb)
+            newSession.open(runtime)
+
+            lastUserAgentOverride?.let {
+                newSession.settings.userAgentOverride = it
+            }
+
+            view.setSession(newSession)
+            session = newSession
+
+            if (!urlToRestore.isNullOrBlank() && urlToRestore != "about:blank") {
+                newSession.loadUri(urlToRestore)
+                AppLogger.i(TAG, "Crash recovery successful, restoring URL: $urlToRestore")
+            } else {
+                AppLogger.i(TAG, "Crash recovery successful (no URL to restore)")
+            }
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Crash recovery failed", e)
+            cb.onError(-2, "Engine crash recovery failed: ${e.message}")
+        }
+    }
+
+    override fun loadUrl(url: String) {
+        session?.loadUri(url)
+    }
+
+    override fun evaluateJavascript(script: String, resultCallback: ((String?) -> Unit)?) {
+        val s = session
+        if (s == null) {
+            resultCallback?.invoke(null)
+            return
+        }
+
+        try {
+            val encoded = android.util.Base64.encodeToString(
+                script.toByteArray(Charsets.UTF_8),
+                android.util.Base64.NO_WRAP
+            )
+            val wrappedScript = "javascript:void(eval(atob('$encoded')))"
+            s.loadUri(wrappedScript)
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "evaluateJavascript encoding failed", e)
+
+            try {
+                val escaped = script
+                    .replace("\\", "\\\\")
+                    .replace("'", "\\'")
+                    .replace("\n", "\\n")
+                    .replace("\r", "\\r")
+                s.loadUri("javascript:void(eval('$escaped'))")
+            } catch (ex: Exception) {
+                AppLogger.e(TAG, "evaluateJavascript fallback also failed", ex)
+            }
+        }
+
+        resultCallback?.invoke(null)
+    }
+
+    override fun canGoBack(): Boolean = canGoBackFlag
+    override fun goBack() { session?.goBack() }
+    override fun canGoForward(): Boolean = canGoForwardFlag
+    override fun goForward() { session?.goForward() }
+    override fun reload() { session?.reload() }
+    override fun stopLoading() { session?.stop() }
+    override fun getCurrentUrl(): String? = currentUrl
+    override fun getTitle(): String? = currentTitle
+    override fun getView(): View? = geckoView
+
+    override fun destroy() {
+        try {
+            session?.close()
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Error closing session", e)
+        }
+        session = null
+        geckoView = null
+        callback = null
+        lastConfig = null
+    }
+
+    override fun clearCache(includeDiskFiles: Boolean) {
+        try {
+            val runtime = sharedRuntime ?: return
+            runtime.storageController.clearData(StorageController.ClearFlags.ALL)
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Error clearing cache", e)
+        }
+    }
+
+    override fun clearHistory() {
+        try {
+            session?.purgeHistory()
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Error clearing history", e)
+        }
+    }
+
 }
