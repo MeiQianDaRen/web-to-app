@@ -1,10 +1,13 @@
 package com.webtoapp.core.engine
 
 import android.content.Context
+import android.util.Base64
 import com.webtoapp.core.logging.AppLogger
+import com.webtoapp.core.i18n.Strings
 import android.view.View
 import com.webtoapp.data.model.UserAgentMode
 import com.webtoapp.data.model.WebViewConfig
+import org.json.JSONObject
 import org.mozilla.geckoview.AllowOrDeny
 import org.mozilla.geckoview.ContentBlocking
 import org.mozilla.geckoview.GeckoResult
@@ -14,6 +17,7 @@ import org.mozilla.geckoview.GeckoSession
 import org.mozilla.geckoview.GeckoSessionSettings
 import org.mozilla.geckoview.GeckoView
 import org.mozilla.geckoview.StorageController
+import org.mozilla.geckoview.WebRequestError
 import org.mozilla.geckoview.WebResponse
 import org.mozilla.geckoview.WebExtension
 
@@ -529,6 +533,26 @@ class GeckoViewEngine(
                 return GeckoResult.fromValue(AllowOrDeny.ALLOW)
             }
 
+            override fun onLoadError(
+                session: GeckoSession,
+                uri: String?,
+                error: WebRequestError
+            ): GeckoResult<String>? {
+                if (error.category != WebRequestError.ERROR_CATEGORY_SECURITY) return null
+
+                val detail = "code=${error.code}, uri=${uri.orEmpty()}"
+                AppLogger.w(TAG, "GeckoView SSL error: $detail")
+
+                if (lastConfig?.errorPageConfig?.showSslErrorUi == false) return null
+
+                callback.onSslError(detail)
+                if (error.code != WebRequestError.ERROR_SECURITY_BAD_CERT || uri.isNullOrBlank()) {
+                    return null
+                }
+
+                return GeckoResult.fromValue(buildCertificateErrorPage(uri))
+            }
+
             override fun onNewSession(
                 session: GeckoSession,
                 uri: String
@@ -538,6 +562,58 @@ class GeckoViewEngine(
             }
         }
     }
+
+    private fun buildCertificateErrorPage(failedUrl: String): String {
+        val title = escapeHtml(Strings.showSslErrorUiTitle)
+        val retry = escapeHtml(Strings.retry)
+        val close = escapeHtml(Strings.cdClose)
+        val displayUrl = escapeHtml(failedUrl)
+        val targetUrl = JSONObject.quote(failedUrl)
+        val html = """
+            <!doctype html>
+            <html>
+            <head>
+                <meta charset="utf-8">
+                <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+                <style>
+                    *{box-sizing:border-box}html,body{height:100%;margin:0}body{display:flex;align-items:center;justify-content:center;padding:24px;background:#f5f7fb;color:#1f2937;font-family:system-ui,-apple-system,sans-serif}.card{width:100%;max-width:560px;padding:28px;border:1px solid #dbe4f0;border-radius:18px;background:#fff;box-shadow:0 18px 50px rgba(35,55,80,.14)}.icon{display:flex;align-items:center;justify-content:center;width:52px;height:52px;margin-bottom:18px;border-radius:50%;background:#fff3db;color:#d97706;font-size:28px}.title{margin:0 0 12px;font-size:22px}.url{margin:0 0 22px;padding:12px;border-radius:10px;background:#f7f9fc;color:#526173;font-size:13px;line-height:1.5;word-break:break-all}.actions{display:flex;flex-wrap:wrap;gap:10px}button{min-height:42px;padding:0 18px;border:0;border-radius:9px;font-size:15px;cursor:pointer}.primary{background:#1677ff;color:#fff}.secondary{background:#edf2f7;color:#334155}button:disabled{opacity:.55}@media(prefers-color-scheme:dark){body{background:#111827;color:#e5e7eb}.card{border-color:#334155;background:#1f2937}.url{background:#111827;color:#cbd5e1}.secondary{background:#374151;color:#f3f4f6}}
+                </style>
+            </head>
+            <body>
+                <main class="card">
+                    <div class="icon">!</div>
+                    <h1 class="title">$title</h1>
+                    <div class="url">$displayUrl</div>
+                    <div class="actions">
+                        <button class="primary" id="proceed" type="button">$retry</button>
+                        <button class="secondary" id="back" type="button">$close</button>
+                    </div>
+                </main>
+                <script>
+                    document.getElementById('proceed').addEventListener('click',function(){
+                        var button=this;
+                        button.disabled=true;
+                        document.addCertException(true).then(function(){
+                            location.replace($targetUrl);
+                        }).catch(function(){
+                            button.disabled=false;
+                        });
+                    });
+                    document.getElementById('back').addEventListener('click',function(){history.back();});
+                </script>
+            </body>
+            </html>
+        """.trimIndent()
+        val encoded = Base64.encodeToString(html.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+        return "data:text/html;base64,$encoded"
+    }
+
+    private fun escapeHtml(value: String): String = value
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("\"", "&quot;")
+        .replace("'", "&#39;")
 
     private fun setupProgressDelegate(session: GeckoSession, callback: BrowserEngineCallback) {
         session.progressDelegate = object : GeckoSession.ProgressDelegate {
