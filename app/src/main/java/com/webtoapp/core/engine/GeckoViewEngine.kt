@@ -543,14 +543,14 @@ class GeckoViewEngine(
                 val detail = "code=${error.code}, uri=${uri.orEmpty()}"
                 AppLogger.w(TAG, "GeckoView SSL error: $detail")
 
+                if (error.code == WebRequestError.ERROR_SECURITY_BAD_CERT && !uri.isNullOrBlank()) {
+                    return GeckoResult.fromValue(buildCertificateErrorPage(uri))
+                }
+
                 if (lastConfig?.errorPageConfig?.showSslErrorUi == false) return null
 
                 callback.onSslError(detail)
-                if (error.code != WebRequestError.ERROR_SECURITY_BAD_CERT || uri.isNullOrBlank()) {
-                    return null
-                }
-
-                return GeckoResult.fromValue(buildCertificateErrorPage(uri))
+                return null
             }
 
             override fun onNewSession(
@@ -576,10 +576,10 @@ class GeckoViewEngine(
                 <meta charset="utf-8">
                 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
                 <style>
-                    *{box-sizing:border-box}html,body{height:100%;margin:0}body{display:flex;align-items:center;justify-content:center;padding:24px;background:#f5f7fb;color:#1f2937;font-family:system-ui,-apple-system,sans-serif}.card{width:100%;max-width:560px;padding:28px;border:1px solid #dbe4f0;border-radius:18px;background:#fff;box-shadow:0 18px 50px rgba(35,55,80,.14)}.icon{display:flex;align-items:center;justify-content:center;width:52px;height:52px;margin-bottom:18px;border-radius:50%;background:#fff3db;color:#d97706;font-size:28px}.title{margin:0 0 12px;font-size:22px}.url{margin:0 0 22px;padding:12px;border-radius:10px;background:#f7f9fc;color:#526173;font-size:13px;line-height:1.5;word-break:break-all}.actions{display:flex;flex-wrap:wrap;gap:10px}button{min-height:42px;padding:0 18px;border:0;border-radius:9px;font-size:15px;cursor:pointer}.primary{background:#1677ff;color:#fff}.secondary{background:#edf2f7;color:#334155}button:disabled{opacity:.55}@media(prefers-color-scheme:dark){body{background:#111827;color:#e5e7eb}.card{border-color:#334155;background:#1f2937}.url{background:#111827;color:#cbd5e1}.secondary{background:#374151;color:#f3f4f6}}
+                    *{box-sizing:border-box}html,body{height:100%;margin:0}body{display:flex;align-items:center;justify-content:center;padding:24px;background:#f5f7fb;color:#1f2937;font-family:system-ui,-apple-system,sans-serif}.card{width:100%;max-width:560px;padding:28px;border:1px solid #dbe4f0;border-radius:18px;background:#fff;box-shadow:0 18px 50px rgba(35,55,80,.14)}.auto-proceed .card{visibility:hidden}.icon{display:flex;align-items:center;justify-content:center;width:52px;height:52px;margin-bottom:18px;border-radius:50%;background:#fff3db;color:#d97706;font-size:28px}.title{margin:0 0 12px;font-size:22px}.url{margin:0 0 22px;padding:12px;border-radius:10px;background:#f7f9fc;color:#526173;font-size:13px;line-height:1.5;word-break:break-all}.actions{display:flex;flex-wrap:wrap;gap:10px}button{min-height:42px;padding:0 18px;border:0;border-radius:9px;font-size:15px;cursor:pointer}.primary{background:#1677ff;color:#fff}.secondary{background:#edf2f7;color:#334155}button:disabled{opacity:.55}@media(prefers-color-scheme:dark){body{background:#111827;color:#e5e7eb}.card{border-color:#334155;background:#1f2937}.url{background:#111827;color:#cbd5e1}.secondary{background:#374151;color:#f3f4f6}}
                 </style>
             </head>
-            <body>
+            <body class="auto-proceed">
                 <main class="card">
                     <div class="icon">!</div>
                     <h1 class="title">$title</h1>
@@ -590,16 +590,19 @@ class GeckoViewEngine(
                     </div>
                 </main>
                 <script>
-                    document.getElementById('proceed').addEventListener('click',function(){
-                        var button=this;
+                    function proceed(){
+                        var button=document.getElementById('proceed');
                         button.disabled=true;
                         document.addCertException(true).then(function(){
                             location.replace($targetUrl);
                         }).catch(function(){
                             button.disabled=false;
+                            document.body.classList.remove('auto-proceed');
                         });
-                    });
+                    }
+                    document.getElementById('proceed').addEventListener('click',proceed);
                     document.getElementById('back').addEventListener('click',function(){history.back();});
+                    proceed();
                 </script>
             </body>
             </html>
