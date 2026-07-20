@@ -252,6 +252,10 @@ class GeckoViewEngine(
             prefs["security.OCSP.require"] = false
             prefs["security.ssl.enable_ocsp_must_staple"] = false
             prefs["security.ssl.enable_ocsp_stapling"] = false
+            prefs["security.mixed_content.block_active_content"] = false
+            prefs["security.mixed_content.block_display_content"] = false
+            prefs["security.mixed_content.upgrade_display_content"] = false
+
             if (config?.echEffective == true) {
                 prefs["network.dns.echconfig.enabled"] = true
                 prefs["network.dns.http3_echconfig.enabled"] = true
