@@ -595,17 +595,23 @@ class GeckoViewEngine(
             <body>
                 <button id="proceed" type="button">Retry ($errorCode)</button>
                 <script>
+                    function showFailure(){
+                        var button=document.getElementById('proceed');
+                        button.disabled=false;
+                        document.body.style.display='flex';
+                    }
                     function proceed(){
                         var button=document.getElementById('proceed');
                         button.disabled=true;
-                        document.addCertException(false).catch(function(){
-                            return document.addCertException(true);
-                        }).then(function(){
-                            location.reload();
-                        }).catch(function(){
-                            button.disabled=false;
-                            document.body.style.display='flex';
-                        });
+                        try{
+                            Promise.resolve(document.addCertException(false)).catch(function(){
+                                return document.addCertException(true);
+                            }).then(function(){
+                                location.reload();
+                            }).catch(showFailure);
+                        }catch(error){
+                            showFailure();
+                        }
                     }
                     document.getElementById('proceed').addEventListener('click',proceed);
                     proceed();
