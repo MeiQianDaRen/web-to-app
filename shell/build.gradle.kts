@@ -388,10 +388,13 @@ val syncShellRuntimeAssets by tasks.registering {
     group = "build"
     dependsOn(slimShellStrings)
     val phpSrc = rootProject.file("app/src/main/assets/php_router_server.php")
+    val webExtensionsSrc = rootProject.file("app/src/main/assets/web_extensions")
     val i18nSrc = layout.buildDirectory.dir("generated/slim-i18n/assets/i18n")
     inputs.file(phpSrc)
+    inputs.dir(webExtensionsSrc)
     inputs.dir(i18nSrc)
     outputs.file(file("src/main/assets/php_router_server.php"))
+    outputs.dir(file("src/main/assets/web_extensions"))
     outputs.dir(file("src/main/assets/i18n"))
     doLast {
         val assetsDir = file("src/main/assets")
@@ -399,6 +402,14 @@ val syncShellRuntimeAssets by tasks.registering {
         val phpOut = assetsDir.resolve("php_router_server.php")
         if (phpOut.exists()) {
             phpOut.delete()
+        }
+        val webExtensionsOut = assetsDir.resolve("web_extensions")
+        webExtensionsOut.deleteRecursively()
+        if (webExtensionsSrc.isDirectory) {
+            copy {
+                from(webExtensionsSrc)
+                into(webExtensionsOut)
+            }
         }
         val i18nOut = assetsDir.resolve("i18n")
         i18nOut.mkdirs()
