@@ -519,11 +519,14 @@ class GeckoViewEngine(
                     return GeckoResult.fromValue(AllowOrDeny.DENY)
                 }
 
+                val scheme = runCatching { android.net.Uri.parse(uri).scheme?.lowercase() }.getOrNull()
+                val targetHost = runCatching { android.net.Uri.parse(uri).host?.lowercase() }.getOrNull()
+                val keepInsideGecko =
+                    (scheme == "http" || scheme == "https") && isIpLiteralHost(targetHost)
+
                 val cfg = lastConfig
-                if (cfg != null && cfg.openExternalLinks) {
-                    val scheme = runCatching { android.net.Uri.parse(uri).scheme?.lowercase() }.getOrNull()
+                if (!keepInsideGecko && cfg != null && cfg.openExternalLinks) {
                     if (scheme == "http" || scheme == "https") {
-                        val targetHost = runCatching { android.net.Uri.parse(uri).host?.lowercase() }.getOrNull()
                         val currentHost = runCatching { currentUrl?.let { android.net.Uri.parse(it).host?.lowercase() } }.getOrNull()
                         if (targetHost != null && currentHost != null &&
                             targetHost != currentHost &&
@@ -533,6 +536,11 @@ class GeckoViewEngine(
                             return GeckoResult.fromValue(AllowOrDeny.DENY)
                         }
                     }
+                }
+
+                if (request.target == GeckoSession.NavigationDelegate.TARGET_WINDOW_NEW) {
+                    geckoView?.post { session.loadUri(uri) }
+                    return GeckoResult.fromValue(AllowOrDeny.DENY)
                 }
 
                 return GeckoResult.fromValue(AllowOrDeny.ALLOW)
@@ -551,27 +559,29 @@ class GeckoViewEngine(
                 val detail = "code=${error.code}, uri=${uri.orEmpty()}"
                 AppLogger.w(TAG, "GeckoView SSL error: $detail")
 
-                if (!uri.isNullOrBlank()) {
-                    return GeckoResult.fromValue(buildCertificateErrorPage())
-                }
-
-                if (lastConfig?.errorPageConfig?.showSslErrorUi == false) return null
-
-                callback.onSslError(detail)
-                return null
+                return GeckoResult.fromValue(buildCertificateErrorPage(error.code))
             }
 
             override fun onNewSession(
                 session: GeckoSession,
                 uri: String
             ): GeckoResult<GeckoSession>? {
-                loadUrl(uri)
+                geckoView?.post { session.loadUri(uri) }
                 return null
             }
         }
     }
 
-    private fun buildCertificateErrorPage(): String {
+    private fun isIpLiteralHost(host: String?): Boolean {
+        if (host.isNullOrBlank()) return false
+        if (host.contains(':')) return true
+        val parts = host.split('.')
+        return parts.size == 4 && parts.all { part ->
+            part.isNotEmpty() && part.all { it.isDigit() } && (part.toIntOrNull() ?: -1) in 0..255
+        }
+    }
+
+    private fun buildCertificateErrorPage(errorCode: Int): String {
         val html = """
             <!doctype html>
             <html>
@@ -583,7 +593,7 @@ class GeckoViewEngine(
                 </style>
             </head>
             <body>
-                <button id="proceed" type="button">Retry</button>
+                <button id="proceed" type="button">Retry ($errorCode)</button>
                 <script>
                     function proceed(){
                         var button=document.getElementById('proceed');
