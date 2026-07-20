@@ -132,6 +132,14 @@
       let parsed; try { parsed = JSON.parse(requestJson); } catch (e) { return Promise.reject(new TypeError('Invalid httpRequest JSON')); }
       return nativeHttpRequest(parsed);
     };
+    window.NativeBridge.createMediaProxyUrl = function (url) {
+      return sendNativeExported(JSON.stringify({ operation: 'createMediaProxyUrl', url: String(url || '') }))
+        .then((raw) => {
+          const result = JSON.parse(String(raw || '{}'));
+          if (!result.ok || !result.url) throw new TypeError(result.message || result.error || 'Media proxy unavailable');
+          return String(result.url);
+        });
+    };
 
     const nativeFetch = window.fetch ? window.fetch.bind(window) : null;
     if (nativeFetch) {
