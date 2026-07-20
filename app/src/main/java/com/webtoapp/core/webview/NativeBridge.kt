@@ -1240,12 +1240,48 @@ if (NativeBridge.isFullscreen()) {
     }
 
     @JavascriptInterface
+    fun createMediaProxyUrl(url: String): String {
+        if (!capabilities.privateNetwork && !corsBypass) {
+            return privateNetworkBridgeError("disabled", "Native private network capability disabled")
+        }
+        val targetUrl = url.trim()
+        if (corsBypass) {
+            if (!isHttpUrl(targetUrl)) {
+                return privateNetworkBridgeError("URL_NOT_ALLOWED", "Only HTTP(S) URLs are allowed")
+            }
+        } else if (!isPrivateNetworkUrl(targetUrl)) {
+            return privateNetworkBridgeError("URL_NOT_ALLOWED", "Only private network HTTP(S) URLs are allowed")
+        }
+        if (!corsBypass) {
+            val pageUrl = webViewProvider()?.url.orEmpty()
+            if (!isPrivateNetworkUrl(pageUrl)) {
+                return privateNetworkBridgeError(
+                    "CALLER_NOT_ALLOWED",
+                    "Only packaged local pages can use the private network bridge"
+                )
+            }
+        }
+        return try {
+            org.json.JSONObject().apply {
+                put("ok", true)
+                put("url", NativeMediaProxy.register(targetUrl))
+            }.toString()
+        } catch (e: Exception) {
+            AppLogger.e("NativeBridge", "Failed to create media proxy URL", e)
+            privateNetworkBridgeError("MEDIA_PROXY_FAILED", e.message ?: e::class.java.simpleName)
+        }
+    }
+
+    @JavascriptInterface
     fun httpRequest(requestJson: String): String {
         if (!capabilities.privateNetwork && !corsBypass) {
             return privateNetworkBridgeError("disabled", "Native private network capability disabled")
         }
         return try {
             val request = org.json.JSONObject(requestJson)
+            if (request.optString("operation") == "createMediaProxyUrl") {
+                return createMediaProxyUrl(request.optString("url"))
+            }
             val url = request.optString("url").trim()
             if (corsBypass) {
                 if (!isHttpUrl(url)) {
@@ -1790,5 +1826,10 @@ class PrivateNetworkNativeBridgeAdapter(
     @JavascriptInterface
     fun httpRequest(requestJson: String): String {
         return delegate.httpRequest(requestJson)
+    }
+
+    @JavascriptInterface
+    fun createMediaProxyUrl(url: String): String {
+        return delegate.createMediaProxyUrl(url)
     }
 }
