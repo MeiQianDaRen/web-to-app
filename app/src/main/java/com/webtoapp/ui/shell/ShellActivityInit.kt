@@ -209,6 +209,19 @@ object ShellActivityInit {
         getShellConfig: () -> ShellConfig?
     ): OnBackPressedCallback {
         return object : OnBackPressedCallback(true) {
+            private var lastExitRequestAt = 0L
+
+            private fun requestExit() {
+                val now = android.os.SystemClock.elapsedRealtime()
+                if (lastExitRequestAt != 0L && now - lastExitRequestAt <= 2000L) {
+                    activity.finish()
+                    return
+                }
+
+                lastExitRequestAt = now
+                Toast.makeText(activity, Strings.confirmExit, Toast.LENGTH_SHORT).show()
+            }
+
             override fun handleOnBackPressed() {
                 if (forcedRunManager.handleKeyEvent(KeyEvent.KEYCODE_BACK)) {
                     Toast.makeText(activity, Strings.cannotExitDuringForcedRun, Toast.LENGTH_SHORT).show()
@@ -222,7 +235,7 @@ object ShellActivityInit {
                             if (surface.canGoBack()) {
                                 surface.goBack()
                             } else {
-                                activity.finish()
+                                requestExit()
                             }
                             return
                         }
@@ -245,10 +258,15 @@ object ShellActivityInit {
                                 }
 
                                 val useJsHistoryBack = getShellConfig()?.webViewConfig?.enableBackStatePreservation ?: false
-                                ShellWebViewNavigation.goBackOrFinish(activity, wv, useJsHistoryBack = useJsHistoryBack)
+                                ShellWebViewNavigation.goBackOrFinish(
+                                    activity = activity,
+                                    webView = wv,
+                                    useJsHistoryBack = useJsHistoryBack,
+                                    onExit = ::requestExit
+                                )
                             }
                         } else {
-                            activity.finish()
+                            requestExit()
                         }
                     }
                 }
