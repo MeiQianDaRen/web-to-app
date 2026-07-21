@@ -213,13 +213,16 @@ object ShellActivityInit {
 
             private fun requestExit() {
                 val now = android.os.SystemClock.elapsedRealtime()
-                if (lastExitRequestAt != 0L && now - lastExitRequestAt <= 2000L) {
+            
+                if (
+                    lastExitRequestAt != 0L &&
+                    now - lastExitRequestAt <= 1000L
+                ) {
                     activity.finishAffinity()
                     return
                 }
-
+            
                 lastExitRequestAt = now
-                Toast.makeText(activity, Strings.confirmExit, Toast.LENGTH_SHORT).show()
             }
 
             override fun handleOnBackPressed() {
