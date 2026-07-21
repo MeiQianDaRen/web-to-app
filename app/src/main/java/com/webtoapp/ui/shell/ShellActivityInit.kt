@@ -224,52 +224,51 @@ object ShellActivityInit {
 
             override fun handleOnBackPressed() {
                 if (forcedRunManager.handleKeyEvent(KeyEvent.KEYCODE_BACK)) {
-                    Toast.makeText(activity, Strings.cannotExitDuringForcedRun, Toast.LENGTH_SHORT).show()
+                    Toast.makeText(
+                        activity,
+                        Strings.cannotExitDuringForcedRun,
+                        Toast.LENGTH_SHORT
+                    ).show()
                     return
                 }
-                when {
-                    getCustomView() != null -> hideCustomView()
-                    else -> {
-                        val surface = getBrowserSurface()
-                        if (surface?.isGecko == true) {
-                            if (surface.canGoBack()) {
-                                surface.goBack()
-                            } else {
-                                requestExit()
-                            }
-                            return
-                        }
 
-                        val wv = surface?.webView ?: getWebView()
-                        if (wv != null) {
-                            wv.evaluateJavascript("""
-                                (function() {
-                                    var evt = new KeyboardEvent('keydown', {
-                                        key: 'Escape', code: 'Escape',
-                                        keyCode: 27, which: 27,
-                                        bubbles: true, cancelable: true
-                                    });
-                                    return !document.dispatchEvent(evt);
-                                })();
-                            """.trimIndent()) { result ->
-                                if (result == "true") {
-
-                                    return@evaluateJavascript
-                                }
-
-                                val useJsHistoryBack = getShellConfig()?.webViewConfig?.enableBackStatePreservation ?: false
-                                ShellWebViewNavigation.goBackOrFinish(
-                                    activity = activity,
-                                    webView = wv,
-                                    useJsHistoryBack = useJsHistoryBack,
-                                    onExit = ::requestExit
-                                )
-                            }
-                        } else {
-                            requestExit()
-                        }
-                    }
+                // 全屏视频优先退出全屏，本次返回不计入退出操作。
+                if (getCustomView() != null) {
+                    hideCustomView()
+                    return
                 }
+
+                // 不再调用 canGoBack()/goBack()，避免 GeckoView 持续遍历网页历史。
+                // 第一次返回先通知网页关闭弹层并显示退出提示；两秒内第二次返回退出 App。
+                val appBackScript = """
+                    (function () {
+                        try {
+                            window.dispatchEvent(new CustomEvent('sgcms-app-back'));
+                        } catch (e) {}
+
+                        try {
+                            document.dispatchEvent(new KeyboardEvent('keyup', {
+                                key: 'Escape',
+                                code: 'Escape',
+                                keyCode: 27,
+                                which: 27,
+                                bubbles: true,
+                                cancelable: true
+                            }));
+                        } catch (e) {}
+
+                        return true;
+                    })();
+                """.trimIndent()
+
+                val surface = getBrowserSurface()
+                if (surface != null) {
+                    surface.evaluateJavascript(appBackScript, null)
+                } else {
+                    getWebView()?.evaluateJavascript(appBackScript, null)
+                }
+
+                requestExit()
             }
         }
     }
