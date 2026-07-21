@@ -214,7 +214,7 @@ object ShellActivityInit {
             private fun requestExit() {
                 val now = android.os.SystemClock.elapsedRealtime()
                 if (lastExitRequestAt != 0L && now - lastExitRequestAt <= 2000L) {
-                    activity.finish()
+                    activity.finishAffinity()
                     return
                 }
 
