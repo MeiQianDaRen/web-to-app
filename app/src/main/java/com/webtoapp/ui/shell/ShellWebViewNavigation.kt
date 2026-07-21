@@ -14,19 +14,30 @@ object ShellWebViewNavigation {
         webView: WebView?,
         useJsHistoryBack: Boolean
     ) {
-        val wv = webView ?: run {
+        goBackOrFinish(activity, webView, useJsHistoryBack) {
             activity.finish()
+        }
+    }
+
+    fun goBackOrFinish(
+        activity: AppCompatActivity,
+        webView: WebView?,
+        useJsHistoryBack: Boolean,
+        onExit: () -> Unit
+    ) {
+        val wv = webView ?: run {
+            onExit()
             return
         }
 
         if (useJsHistoryBack) {
-            goBackViaJsHistoryBack(activity, wv)
+            goBackViaJsHistoryBack(wv, onExit)
             return
         }
-        goBackNative(activity, wv)
+        goBackNative(wv, onExit)
     }
 
-    private fun goBackViaJsHistoryBack(activity: AppCompatActivity, webView: WebView) {
+    private fun goBackViaJsHistoryBack(webView: WebView, onExit: () -> Unit) {
         // Prefer JS history.back() over the native WebView.goBack(): the JS
         // route runs through the page's own popstate/pageshow handlers and is
         // more likely to restore the previous DOM via bfcache instead of doing
@@ -44,11 +55,11 @@ object ShellWebViewNavigation {
         })();""".trimIndent()
         webView.evaluateJavascript(js) { result ->
             if ("back" == result) return@evaluateJavascript
-            goBackNative(activity, webView)
+            goBackNative(webView, onExit)
         }
     }
 
-    private fun goBackNative(activity: AppCompatActivity, wv: WebView) {
+    private fun goBackNative(wv: WebView, onExit: () -> Unit) {
         val list = wv.copyBackForwardList()
         val currentIndex = list.currentIndex
         val currentItem = list.getItemAtIndex(currentIndex)
@@ -70,7 +81,7 @@ object ShellWebViewNavigation {
         )
 
         when (resolveBackAction(wv.canGoBack(), currentIndex, currentUrls, previousUrls, beforePreviousUrls)) {
-            BackAction.FINISH -> activity.finish()
+            BackAction.FINISH -> onExit()
             BackAction.GO_BACK -> wv.goBack()
             BackAction.SKIP_PREVIOUS -> wv.goBackOrForward(-2)
         }
